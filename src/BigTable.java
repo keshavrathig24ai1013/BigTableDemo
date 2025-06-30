@@ -16,484 +16,252 @@ import com.google.cloud.bigtable.data.v2.models.Range.ByteStringRange;
 import java.io.BufferedReader;
 import java.io.FileReader;
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.Map;
+import java.util.*;
 import java.util.logging.Logger;
 
-/*
- * Use Google Bigtable to store and analyze sensor data.
- */
 public class BigTable {
-    // TODO: Fill in information for your database
-    public final String projectId = "bigtabledemo-463315";
-    public final String instanceId = "assignment4";
-    public final String COLUMN_FAMILY = "sensor";
-    public final String tableId = "weather"; // TODO: Must change table name if sharing my database
+    private final String projectId = "bigtabledemo-463315";
+    private final String instanceId = "assignment4";
+    private final String COLUMN_FAMILY = "sensor";
+    private final String tableId = "weather";
 
-    public BigtableDataClient dataClient;
-    public BigtableTableAdminClient adminClient;
+    private BigtableDataClient dataClient;
+    private BigtableTableAdminClient adminClient;
 
     public static void main(String[] args) throws Exception {
-        BigTable testBigTable = new BigTable();
-        testBigTable.run();
+        BigTable app = new BigTable();
+        app.execute();
     }
 
-    public void connect() throws IOException {
-        // TODO: Write code to create a data client and admin client to connect to Google Bigtable
-        // Create settings for the data client
-        BigtableDataSettings dataSettings = BigtableDataSettings.newBuilder()
-                .setProjectId(projectId)
-                .setInstanceId(instanceId)
-                .build();
+    public void execute() throws Exception {
+        setupClients();
 
-        // Create settings for the admin client
-        BigtableTableAdminSettings adminSettings = BigtableTableAdminSettings.newBuilder()
-                .setProjectId(projectId)
-                .setInstanceId(instanceId)
-                .build();
-
-        // Create the clients
-        dataClient = BigtableDataClient.create(dataSettings);
-        adminClient = BigtableTableAdminClient.create(adminSettings);
-
-        System.out.println("Connected to Bigtable instance: " + instanceId);
-    }
-
-    public void run() throws Exception {
-        connect();
-
-        // TODO: Comment or uncomment these as you proceed. Once load data, comment them out.
         deleteTable();
         createTable();
-        loadData();
+        ingestData();
 
-        int temp = query1();
-        System.out.println("Temperature: " + temp);
+        System.out.println("Temperature: " + getTemperature());
+        System.out.println("WindSpeed: " + getMaxWindSpeed());
 
-        int windSpeed = query2();
-        System.out.println("WindSpeed: " + windSpeed);
+        List<Object[]> readings = getSeaTacReadings();
+        System.out.println("\n=== SeaTac Readings for Oct 2, 2022 ===");
+        displayData(readings);
 
-        ArrayList<Object[]> data = query3();
-        System.out.println("\n=== Query 3 Results: All readings for SeaTac on October 2, 2022 ===");
-        printTableFormat(data);
+        System.out.println("Temperature: " + getHighestSummerTemperature());
+        calculateAvgHumidity("2022-09-15");
 
-        temp = query4();
-        System.out.println("Temperature: " + temp);
-
-        query5();
-
-        close();
+        closeClients();
     }
 
-    /**
-     * Close data and admin clients
-     */
-    public void close() {
+    private void setupClients() throws IOException {
+        BigtableDataSettings dataSettings = BigtableDataSettings.newBuilder()
+                .setProjectId(projectId).setInstanceId(instanceId).build();
+        BigtableTableAdminSettings adminSettings = BigtableTableAdminSettings.newBuilder()
+                .setProjectId(projectId).setInstanceId(instanceId).build();
+        dataClient = BigtableDataClient.create(dataSettings);
+        adminClient = BigtableTableAdminClient.create(adminSettings);
+        System.out.println("Connected to instance: " + instanceId);
+    }
+
+    private void closeClients() {
         dataClient.close();
         adminClient.close();
     }
 
-    public void createTable() {
-        // TODO: Create a table to store sensor data.
+    private void createTable() {
         try {
-            CreateTableRequest createTableRequest = CreateTableRequest.of(tableId)
-                    .addFamily(COLUMN_FAMILY);
-
-            adminClient.createTable(createTableRequest);
-            System.out.println("Table " + tableId + " created successfully");
+            CreateTableRequest request = CreateTableRequest.of(tableId).addFamily(COLUMN_FAMILY);
+            adminClient.createTable(request);
+            System.out.println("Created table: " + tableId);
         } catch (Exception e) {
-            System.err.println("Error creating table: " + e.getMessage());
+            System.err.println("Create table failed: " + e.getMessage());
         }
     }
 
-    /**
-     * Loads data into database.
-     * Data is in CSV files. Note that must convert to hourly data.
-     * Take the first reading in a hour and ignore any others.
-     */
-    public void loadData() throws Exception {
-        String path = "src/bin/data/";
-
-        // TODO: Load data from CSV files into sensor table
-        try {
-            // SeaTac station id is SEA
-            System.out.println("Load data for SeaTac");
-            loadStationData(path + "seatac.csv", "SEA");
-
-            // Vancouver station id is YVR
-            System.out.println("Loading data for Vancouver");
-            loadStationData(path + "vancouver.csv", "YVR");
-
-            // Portland station id is PDX
-            System.out.println("Loading data for Portland");
-            loadStationData(path + "portland.csv", "PDX");
-
-        } catch (Exception e) {
-            throw new Exception(e);
-        }
+    private void ingestData() throws Exception {
+        String basePath = "src/bin/data/";
+        loadStation(basePath + "seatac.csv", "SEA");
+        loadStation(basePath + "vancouver.csv", "YVR");
+        loadStation(basePath + "portland.csv", "PDX");
     }
 
-    private void loadStationData(String filename, String stationId) throws Exception {
-        BufferedReader reader = new BufferedReader(new FileReader(filename));
+    private void loadStation(String filePath, String stationCode) throws Exception {
+        BufferedReader reader = new BufferedReader(new FileReader(filePath));
         String line;
-        boolean isHeader = true;
-        Map<String, Boolean> hourlyDataLoaded = new HashMap<>();
-        BulkMutation bulkMutation = BulkMutation.create(TableId.of(tableId));
+        boolean skipHeaders = true;
+        Set<String> hourMarkers = new HashSet<>();
+        BulkMutation batch = BulkMutation.create(TableId.of(tableId));
 
         while ((line = reader.readLine()) != null) {
-            // Skip header rows
-            if (isHeader) {
-                if (line.contains("Date,Time")) {
-                    isHeader = false;
-                }
+            if (skipHeaders && line.contains("Date,Time")) {
+                skipHeaders = false;
                 continue;
             }
+            if (skipHeaders) continue;
 
             String[] parts = line.split(",");
             if (parts.length < 9) continue;
 
             String date = parts[1].trim();
             String time = parts[2].trim();
+            String hour = String.format("%02d", Integer.parseInt(time.split(":" )[0]));
+            String marker = date + "-" + hour;
 
-            // Extract hour from time (HH:MM format)
-            int hourInt = Integer.parseInt(time.split(":")[0]);
-            String hour = String.format("%02d", hourInt);  // "00", "01", "02", etc.
-            String hourKey = date + "-" + hour;
+            if (!hourMarkers.add(marker)) continue;
 
-            // Skip if we already have data for this hour
-            if (hourlyDataLoaded.containsKey(hourKey)) {
-                continue;
-            }
-            hourlyDataLoaded.put(hourKey, true);
-
-            // Create row key: stationId#date#hour
-            String rowKey = stationId + "#" + date + "#" + hour;
-
-            // Parse data values
-            String temperature = parts[3].trim();
-            String dewPoint = parts[4].trim();
-            String humidity = parts[5].trim();
-            String windSpeed = parts[6].trim();
-            String gust = parts[7].trim();
-            String pressure = parts[8].trim();
-
-            // Create mutations for this row
+            String rowKey = stationCode + "#" + date + "#" + hour;
             Mutation mutation = Mutation.create()
-                    .setCell(COLUMN_FAMILY, "temperature", temperature)
-                    .setCell(COLUMN_FAMILY, "dewPoint", dewPoint)
-                    .setCell(COLUMN_FAMILY, "humidity", humidity)
-                    .setCell(COLUMN_FAMILY, "windSpeed", windSpeed)
-                    .setCell(COLUMN_FAMILY, "gust", gust)
-                    .setCell(COLUMN_FAMILY, "pressure", pressure)
+                    .setCell(COLUMN_FAMILY, "temperature", parts[3].trim())
+                    .setCell(COLUMN_FAMILY, "dewPoint", parts[4].trim())
+                    .setCell(COLUMN_FAMILY, "humidity", parts[5].trim())
+                    .setCell(COLUMN_FAMILY, "windSpeed", parts[6].trim())
+                    .setCell(COLUMN_FAMILY, "gust", parts[7].trim())
+                    .setCell(COLUMN_FAMILY, "pressure", parts[8].trim())
                     .setCell(COLUMN_FAMILY, "time", time);
 
-            bulkMutation.add(rowKey, mutation);
+            batch.add(rowKey, mutation);
         }
-
         reader.close();
-
-        // Execute bulk mutation
-        dataClient.bulkMutateRows(bulkMutation);
-        System.out.println("Loaded data for station: " + stationId);
+        dataClient.bulkMutateRows(batch);
+        System.out.println("Data loaded for: " + stationCode);
     }
 
-    /**
-     * Query returns the temperature at Vancouver on 2022-10-01 at 10 a.m.
-     */
-    public int query1() {
-        System.out.println("Executing query #1.");
-
-        // Row key: YVR#2022-10-01#10
-        String rowKey = "YVR#2022-10-01#10";
-
-        Row row = dataClient.readRow(TableId.of(tableId), rowKey);
+    private int getTemperature() {
+        Row row = dataClient.readRow(TableId.of(tableId), "YVR#2022-10-01#10");
         if (row != null) {
             for (RowCell cell : row.getCells(COLUMN_FAMILY, "temperature")) {
-                String tempStr = cell.getValue().toStringUtf8();
-                return Integer.parseInt(tempStr);
+                return Integer.parseInt(cell.getValue().toStringUtf8());
             }
         }
-
         return 0;
     }
 
-    /**
-     * Query returns the highest wind speed in the month of September 2022 in Portland.
-     */
-    public int query2() {
-        System.out.println("Executing query #2.");
-        int maxWindSpeed = 0;
-
-        // Create query for Portland in September 2022
+    private int getMaxWindSpeed() {
+        int maxSpeed = 0;
         Query query = Query.create(TableId.of(tableId))
                 .range(ByteStringRange.create("PDX#2022-09-01", "PDX#2022-09-31"));
-
-        ServerStream<Row> rows = dataClient.readRows(query);
-
-        for (Row row : rows) {
+        for (Row row : dataClient.readRows(query)) {
             for (RowCell cell : row.getCells(COLUMN_FAMILY, "windSpeed")) {
-                String windSpeedStr = cell.getValue().toStringUtf8();
-                if (!windSpeedStr.equals("M")) { // M means missing data
-                    try {
-                        int windSpeed = Integer.parseInt(windSpeedStr);
-                        if (windSpeed > maxWindSpeed) {
-                            maxWindSpeed = windSpeed;
-                        }
-                    } catch (NumberFormatException e) {
-                        Logger.getGlobal().warning("Invalid windSpeed value: " + windSpeedStr);
-                    }
-                }
+                try {
+                    int speed = Integer.parseInt(cell.getValue().toStringUtf8());
+                    maxSpeed = Math.max(maxSpeed, speed);
+                } catch (NumberFormatException ignored) {}
             }
         }
-
-        return maxWindSpeed;
+        return maxSpeed;
     }
 
-    /**
-     * Query returns all the readings for SeaTac for October 2, 2022.
-     */
-    public ArrayList<Object[]> query3() {
-        System.out.println("Executing query #3.");
-        ArrayList<Object[]> data = new ArrayList<>();
-
-        // Create query for SeaTac on October 2, 2022
+    private List<Object[]> getSeaTacReadings() {
+        List<Object[]> results = new ArrayList<>();
         Query query = Query.create(TableId.of(tableId))
                 .range(ByteStringRange.create("SEA#2022-10-02#00", "SEA#2022-10-02#24"));
 
-        ServerStream<Row> rows = dataClient.readRows(query);
-
-        for (Row row : rows) {
-            // Extract date and hour from row key
-            String rowKey = row.getKey().toStringUtf8();
-            String[] keyParts = rowKey.split("#");
-            String date = keyParts[1];
-            String hour = keyParts[2];
-
-            // Get all sensor values
-            String temperature = "";
-            String dewpoint = "";
-            String humidity = "";
-            String windSpeed = "";
-            String pressure = "";
-
+        for (Row row : dataClient.readRows(query)) {
+            String[] key = row.getKey().toStringUtf8().split("#");
+            Object[] record = new Object[7];
+            record[0] = key[1];
+            record[1] = key[2];
             for (RowCell cell : row.getCells()) {
                 String qualifier = cell.getQualifier().toStringUtf8();
                 String value = cell.getValue().toStringUtf8();
-
                 switch (qualifier) {
-                    case "temperature":
-                        temperature = value;
-                        break;
-                    case "dewPoint":
-                        dewpoint = value;
-                        break;
-                    case "humidity":
-                        humidity = value;
-                        break;
-                    case "windSpeed":
-                        windSpeed = value;
-                        break;
-                    case "pressure":
-                        pressure = value;
-                        break;
+                    case "temperature": record[2] = Integer.parseInt(value); break;
+                    case "dewPoint": record[3] = Integer.parseInt(value); break;
+                    case "humidity": record[4] = value; break;
+                    case "windSpeed": record[5] = value; break;
+                    case "pressure": record[6] = value; break;
                 }
             }
-
-            // Create object array with required fields
-            Object[] rowData = new Object[]{
-                    date,
-                    hour,
-                    Integer.parseInt(temperature),
-                    Integer.parseInt(dewpoint),
-                    humidity,
-                    windSpeed,
-                    pressure
-            };
-
-            data.add(rowData);
+            results.add(record);
         }
-
-        return data;
+        return results;
     }
 
-    /**
-     * Query returns the highest temperature at any station in the summer months of 2022 (July (7), August (8)).
-     */
-    public int query4() {
-        System.out.println("Executing query #4.");
+    private int getHighestSummerTemperature() {
         int maxTemp = -100;
-
-        // Check all three stations for July and August
-        String[] stations = {"PDX", "SEA", "YVR"};
-
-        for (String station : stations) {
-            // Query for July
-            Query julyQuery = Query.create(TableId.of(tableId))
-                    .range(ByteStringRange.create(station + "#2022-07-01", station + "#2022-07-32"));
-
-            maxTemp = getMaxTemp(maxTemp, julyQuery);
-
-            // Query for August
-            Query augustQuery = Query.create(TableId.of(tableId))
-                    .range(ByteStringRange.create(station + "#2022-08-01", station + "#2022-08-32"));
-
-            maxTemp = getMaxTemp(maxTemp, augustQuery);
+        for (String station : Arrays.asList("PDX", "SEA", "YVR")) {
+            maxTemp = Math.max(maxTemp, fetchMaxTemp(Query.create(TableId.of(tableId))
+                    .range(ByteStringRange.create(station + "#2022-07-01", station + "#2022-07-32")), maxTemp));
+            maxTemp = Math.max(maxTemp, fetchMaxTemp(Query.create(TableId.of(tableId))
+                    .range(ByteStringRange.create(station + "#2022-08-01", station + "#2022-08-32")), maxTemp));
         }
-
         return maxTemp;
     }
 
-    private int getMaxTemp(int maxTemp, Query query) {
-        ServerStream<Row> julyRows = dataClient.readRows(query);
-
-        for (Row row : julyRows) {
+    private int fetchMaxTemp(Query query, int currentMax) {
+        for (Row row : dataClient.readRows(query)) {
             for (RowCell cell : row.getCells(COLUMN_FAMILY, "temperature")) {
-                String tempStr = cell.getValue().toStringUtf8();
                 try {
-                    int temp = Integer.parseInt(tempStr);
-                    if (temp > maxTemp) {
-                        maxTemp = temp;
-                    }
-                } catch (NumberFormatException e) {
-                    Logger.getGlobal().warning("Invalid temperature value: " + tempStr);
-                }
+                    currentMax = Math.max(currentMax, Integer.parseInt(cell.getValue().toStringUtf8()));
+                } catch (NumberFormatException ignored) {}
             }
         }
-        return maxTemp;
+        return currentMax;
     }
 
-    /**
-     * Create your own query and test case demonstrating some different.
-     * This query finds the average humidity across all stations for a specific date (2022-09-15)
-     */
-    public void query5() {
-        System.out.println("Executing query #5 - Average humidity across all stations on 2022-09-15");
-
-        String targetDate = "2022-09-15";
-        String[] stations = {"PDX", "SEA", "YVR"};
-        int totalHumidity = 0;
-        int count = 0;
-
-        // Query each station for the specific date
-        for (String station : stations) {
+    private void calculateAvgHumidity(String date) {
+        int sum = 0, count = 0;
+        for (String station : Arrays.asList("PDX", "SEA", "YVR")) {
             Query query = Query.create(TableId.of(tableId))
-                    .range(ByteStringRange.create(
-                            station + "#" + targetDate + "#00",
-                            station + "#" + targetDate + "#24"
-                    ));
-
-            ServerStream<Row> rows = dataClient.readRows(query);
-
-            for (Row row : rows) {
+                    .range(ByteStringRange.create(station + "#" + date + "#00", station + "#" + date + "#24"));
+            for (Row row : dataClient.readRows(query)) {
                 for (RowCell cell : row.getCells(COLUMN_FAMILY, "humidity")) {
-                    String humidityStr = cell.getValue().toStringUtf8();
                     try {
-                        double humidity = Double.parseDouble(humidityStr);
-                        totalHumidity += (int) humidity;
+                        sum += Integer.parseInt(cell.getValue().toStringUtf8());
                         count++;
-                    } catch (NumberFormatException e) {
-                        Logger.getGlobal().warning("Invalid humidity value: " + humidityStr);
-                    }
+                    } catch (NumberFormatException ignored) {}
                 }
             }
         }
-
-        // Calculate and return average
         if (count > 0) {
-            int avgHumidity = totalHumidity / count;
-            System.out.println("Found " + count + " humidity readings across all stations");
-            System.out.println("Average humidity on " + targetDate + ": " + avgHumidity + "%");
+            System.out.println("Average humidity on " + date + ": " + (sum / count) + "%");
         } else {
-            System.out.println("No humidity data found for " + targetDate);
+            System.out.println("No data found for humidity on " + date);
         }
     }
 
-    /**
-     * Delete the table from Bigtable.
-     */
-    public void deleteTable() {
-        System.out.println("\nDeleting table: " + tableId);
+    private void deleteTable() {
         try {
             adminClient.deleteTable(tableId);
-            System.out.printf("Table %s deleted successfully%n", tableId);
+            System.out.println("Deleted table: " + tableId);
         } catch (NotFoundException e) {
-            System.err.println("Failed to delete a non-existent table: " + e.getMessage());
+            System.err.println("Table does not exist: " + e.getMessage());
         }
     }
 
-    /*
-     Credits: took help from ChatGPT for this function which helps in printing
-     the data in a tabular format since there is a lot of data
-    */
-    private void printTableFormat(ArrayList<Object[]> data) {
-        if (data.isEmpty()) {
-            System.out.println("No data found.");
-            return;
-        }
-
-        // Define headers
+    private void displayData(List<Object[]> records) {
         String[] headers = {"Date", "Hour", "Temperature", "Dewpoint", "Humidity", "Windspeed", "Pressure"};
+        int[] widths = Arrays.stream(headers).mapToInt(String::length).toArray();
 
-        // Calculate column widths
-        int[] columnWidths = new int[headers.length];
-
-        // Initialize with header lengths
-        for (int i = 0; i < headers.length; i++) {
-            columnWidths[i] = headers[i].length();
-        }
-
-        // Check data for maximum widths
-        for (Object[] row : data) {
-            for (int i = 0; i < row.length && i < columnWidths.length; i++) {
-                int length = row[i].toString().length();
-                if (length > columnWidths[i]) {
-                    columnWidths[i] = length;
-                }
+        for (Object[] row : records) {
+            for (int i = 0; i < row.length; i++) {
+                widths[i] = Math.max(widths[i], row[i].toString().length());
             }
         }
 
-        // Add padding
-        for (int i = 0; i < columnWidths.length; i++) {
-            columnWidths[i] += 2;
-        }
-
-        // Print table border
-        printTableBorder(columnWidths);
-
-        // Print headers
+        printBorder(widths);
         System.out.print("|");
         for (int i = 0; i < headers.length; i++) {
-            System.out.printf(" %-" + (columnWidths[i] - 1) + "s|", headers[i]);
+            System.out.printf(" %" + widths[i] + "s |", headers[i]);
         }
         System.out.println();
+        printBorder(widths);
 
-        // Print separator
-        printTableBorder(columnWidths);
-
-        // Print data rows
-        for (Object[] row : data) {
+        for (Object[] row : records) {
             System.out.print("|");
-            for (int i = 0; i < row.length && i < columnWidths.length; i++) {
-                System.out.printf(" %-" + (columnWidths[i] - 1) + "s|", row[i].toString());
+            for (int i = 0; i < row.length; i++) {
+                System.out.printf(" %" + widths[i] + "s |", row[i]);
             }
             System.out.println();
         }
-
-        // Print bottom border
-        printTableBorder(columnWidths);
-
-        // Print summary
-        System.out.println("Total records: " + data.size());
+        printBorder(widths);
+        System.out.println("Total rows: " + records.size());
     }
 
-    // Helper method to print table borders
-    private void printTableBorder(int[] columnWidths) {
+    private void printBorder(int[] widths) {
         System.out.print("+");
-        for (int width : columnWidths) {
-            for (int i = 0; i < width; i++) {
-                System.out.print("-");
-            }
+        for (int width : widths) {
+            for (int i = 0; i < width + 2; i++) System.out.print("-");
             System.out.print("+");
         }
         System.out.println();
